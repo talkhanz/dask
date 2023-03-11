@@ -28,8 +28,433 @@ from dask.array.wrap import empty, full, ones, zeros
 from dask.base import tokenize
 from dask.highlevelgraph import HighLevelGraph
 from dask.utils import cached_cumsum, derived_from, is_cupy_type
+#### np.fill_diagonal imports
+from numpy.core.multiarray import (normalize_axis_index as np_normalize_axis_index)
+from numpy.core.numeric import (asarray as np_asarray, asanyarray as np_asanyarray, alltrue as np_alltrue)
+from numpy.core import overrides
+from numpy.core.umath import (not_equal as np_not_equal,subtract as  np_subtract)
+from functools import partial
 
+######## np.fill_diagonal reimplementation to np_fill_diagonal to return array instead
+def _fill_diagonal_dispatcher(a, val, wrap=None):
+    return (a,)
+array_function_dispatch = partial(
+    overrides.array_function_dispatch, module='numpy')
 
+def _diff_dispatcher(a, n=None, axis=None, prepend=None, append=None):
+    return (a, prepend, append)
+@array_function_dispatch(_diff_dispatcher)
+def np_diff(a, n=1, axis=-1, prepend=np._NoValue, append=np._NoValue):
+    """
+    Calculate the n-th discrete difference along the given axis.
+    The first difference is given by ``out[i] = a[i+1] - a[i]`` along
+    the given axis, higher differences are calculated by using `diff`
+    recursively.
+    Parameters
+    ----------
+    a : array_like
+        Input array
+    n : int, optional
+        The number of times values are differenced. If zero, the input
+        is returned as-is.
+    axis : int, optional
+        The axis along which the difference is taken, default is the
+        last axis.
+    prepend, append : array_like, optional
+        Values to prepend or append to `a` along axis prior to
+        performing the difference.  Scalar values are expanded to
+        arrays with length 1 in the direction of axis and the shape
+        of the input array in along all other axes.  Otherwise the
+        dimension and shape must match `a` except along axis.
+        .. versionadded:: 1.16.0
+    Returns
+    -------
+    diff : ndarray
+        The n-th differences. The shape of the output is the same as `a`
+        except along `axis` where the dimension is smaller by `n`. The
+        type of the output is the same as the type of the difference
+        between any two elements of `a`. This is the same as the type of
+        `a` in most cases. A notable exception is `datetime64`, which
+        results in a `timedelta64` output array.
+    See Also
+    --------
+    gradient, ediff1d, cumsum
+    Notes
+    -----
+    Type is preserved for boolean arrays, so the result will contain
+    `False` when consecutive elements are the same and `True` when they
+    differ.
+    For unsigned integer arrays, the results will also be unsigned. This
+    should not be surprising, as the result is consistent with
+    calculating the difference directly:
+    >>> u8_arr = np.array([1, 0], dtype=np.uint8)
+    >>> np.diff(u8_arr)
+    array([255], dtype=uint8)
+    >>> u8_arr[1,...] - u8_arr[0,...]
+    255
+    If this is not desirable, then the array should be cast to a larger
+    integer type first:
+    >>> i16_arr = u8_arr.astype(np.int16)
+    >>> np.diff(i16_arr)
+    array([-1], dtype=int16)
+    Examples
+    --------
+    >>> x = np.array([1, 2, 4, 7, 0])
+    >>> np.diff(x)
+    array([ 1,  2,  3, -7])
+    >>> np.diff(x, n=2)
+    array([  1,   1, -10])
+    >>> x = np.array([[1, 3, 6, 10], [0, 5, 6, 8]])
+    >>> np.diff(x)
+    array([[2, 3, 4],
+           [5, 1, 2]])
+    >>> np.diff(x, axis=0)
+    array([[-1,  2,  0, -2]])
+    >>> x = np.arange('1066-10-13', '1066-10-16', dtype=np.datetime64)
+    >>> np.diff(x)
+    array([1, 1], dtype='timedelta64[D]')
+    """
+    if n == 0:
+        return a
+    if n < 0:
+        raise ValueError(
+            "order must be non-negative but got " + repr(n))
+
+    a = np_asanyarray(a)
+    nd = a.ndim
+    if nd == 0:
+        raise ValueError("diff requires input that is at least one dimensional")
+    axis = np_normalize_axis_index(axis, nd)
+
+    combined = []
+    if prepend is not np._NoValue:
+        prepend = np.asanyarray(prepend)
+        if prepend.ndim == 0:
+            shape = list(a.shape)
+            shape[axis] = 1
+            prepend = np.broadcast_to(prepend, tuple(shape))
+        combined.append(prepend)
+
+    combined.append(a)
+
+    if append is not np._NoValue:
+        append = np.asanyarray(append)
+        if append.ndim == 0:
+            shape = list(a.shape)
+            shape[axis] = 1
+            append = np.broadcast_to(append, tuple(shape))
+        combined.append(append)
+
+    if len(combined) > 1:
+        a = np.concatenate(combined, axis)
+
+    slice1 = [slice(None)] * nd
+    slice2 = [slice(None)] * nd
+    slice1[axis] = slice(1, None)
+    slice2[axis] = slice(None, -1)
+    slice1 = tuple(slice1)
+    slice2 = tuple(slice2)
+
+    op = np_not_equal if a.dtype == np.bool_ else np_subtract
+    for _ in range(n):
+        a = op(a[slice1], a[slice2])
+
+    return a
+
+@array_function_dispatch(_fill_diagonal_dispatcher)
+def np_fill_diagonal(a, val, wrap=False):
+    """Fill the main diagonal of the given array of any dimensionality.
+    For an array `a` with ``a.ndim >= 2``, the diagonal is the list of
+    locations with indices ``a[i, ..., i]`` all identical. This function
+    DOES NOT modify the input array in-place
+    Parameters
+    ----------
+    a : array, at least 2-D.
+      Array whose diagonal is to be filled, it gets modified in-place.
+    val : scalar or array_like
+      Value(s) to write on the diagonal. If `val` is scalar, the value is
+      written along the diagonal. If array-like, the flattened `val` is
+      written along the diagonal, repeating if necessary to fill all
+      diagonal entries.
+    wrap : bool
+      For tall matrices in NumPy version up to 1.6.2, the
+      diagonal "wrapped" after N columns. You can have this behavior
+      with this option. This affects only tall matrices.
+    Returns
+    -------
+    a : ndarray of shape (N,M)
+      An array where the diagonal values are equal to val.
+    """
+    a = a.copy() #
+    if a.ndim < 2:
+        raise ValueError("array must be at least 2-d")
+    end = None
+    if a.ndim == 2:
+        # Explicit, fast formula for the common case.  For 2-d arrays, we
+        # accept rectangular ones.
+        step = a.shape[1] + 1
+        # This is needed to don't have tall matrix have the diagonal wrap.
+        if not wrap:
+            end = a.shape[1] * a.shape[1]
+    else:
+        # For more than d=2, the strided formula is only valid for arrays with
+        # all dimensions equal, so we check first.
+        if not np_alltrue(np_diff(a.shape) == 0):
+            raise ValueError("All dimensions of input must be of equal length")
+        step = 1 + (np.cumprod(a.shape[:-1])).sum()
+
+    # Write the value out into the diagonal.
+    a.flat[:end:step] = val
+    return a
+######## dasl.fill_diagonal implementation return array instead
+def fill_diagonal(v, val=0,wrap=False):
+    """Fill the main diagonal of the given array of any dimensionality.
+    For an array `a` with ``a.ndim >= 2``, the diagonal is the list of
+    locations with indices ``a[i, ..., i]`` all identical. This function
+    modifies the input array in-place, it does not return a value.
+    Parameters
+    ----------
+    v : array, at least 2-D.
+      Array whose diagonal is to be filled, it gets modified in-place.
+    val : scalar or array_like
+      Value(s) to write on the diagonal. If `val` is scalar, the value is
+      written along the diagonal. If array-like, the flattened `val` is
+      written along the diagonal, repeating if necessary to fill all
+      diagonal entries.
+    wrap : bool
+      For tall matrices in NumPy version up to 1.6.2, the
+      diagonal "wrapped" after N columns. You can have this behavior
+      with this option. This affects only tall matrices.
+    Examples
+    --------
+    >>> a = da.zeros((3, 3))
+    >>> da.fill_diagonal(a, 5).compute()
+    >>> a.compute()
+    array([[5, 0, 0],
+           [0, 5, 0],
+           [0, 0, 5]])
+    The same function can operate on a 4-D array:
+    >>> a = da.zeros((3, 3, 3, 3))
+    >>> da.fill_diagonal(a, 4).compute()
+    We only show a few blocks for clarity:
+    The wrap option affects only tall matrices:
+    >>> # tall matrices no wrap
+    >>> a = da.zeros((5, 3))
+    >>> da.fill_diagonal(a, 4).compute()
+    >>> a.compute()
+    array([[4, 0, 0],
+           [0, 4, 0],
+           [0, 0, 4],
+           [0, 0, 0],
+           [0, 0, 0]])
+    >>> # tall matrices wrap
+    >>> a = da.zeros((5, 3))
+    >>> da.fill_diagonal(a, 4, wrap=True).compute()
+    >>> a.compute()
+    array([[4, 0, 0],
+           [0, 4, 0],
+           [0, 0, 4],
+           [0, 0, 0],
+           [4, 0, 0]])
+    >>> # wide matrices
+    >>> a = da.zeros((3, 5))
+    >>> da.fill_diagonal(a, 4, wrap=True).compute()
+    >>> a.compute()
+    array([[4, 0, 0, 0, 0],
+           [0, 4, 0, 0, 0],
+           [0, 0, 4, 0, 0]])
+    The anti-diagonal can be filled by reversing the order of elements
+    using either `numpy.flipud` or `numpy.fliplr`.
+    >>> a = da.zeros((3, 3));
+    >>> da.fill_diagonal(da.fliplr(a), [1,2,3]).compute()  # Horizontal flip
+    >>> a.compute()
+    array([[0, 0, 1],
+           [0, 2, 0],
+           [3, 0, 0]])
+    >>> da.fill_diagonal(da.flipud(a), [1,2,3]).compute()  # Vertical flip
+    >>> a.compute()
+    array([[0, 0, 3],
+           [0, 2, 0],
+           [1, 0, 0]])
+    Note that the order in which the diagonal is filled varies depending
+    on the flip function.
+    """
+    def fill_diagonal_higher_dims(a,val,wrap=False):
+        offset=0
+        axis1=0
+        axis2=1
+        name = "fill_diagonal_higher_dims-" + tokenize(a, val, wrap)
+
+        if a.ndim < 2:
+            # NumPy uses `diag` as we do here.
+            raise ValueError("fill_diagonal_higher_dims requires an array of at least two dimensions")
+
+        def _axis_fmt(axis, name, ndim):
+            if axis < 0:
+                t = ndim + axis
+                if t < 0:
+                    msg = "{}: axis {} is out of bounds for array of dimension {}"
+                    raise np.AxisError(msg.format(name, axis, ndim))
+                axis = t
+            return axis
+
+        def pop_axes(chunks, axis1, axis2):
+            chunks = list(chunks)
+            chunks.pop(axis2)
+            chunks.pop(axis1)
+            return tuple(chunks)
+
+        axis1 = _axis_fmt(axis1, "axis1", a.ndim)
+        axis2 = _axis_fmt(axis2, "axis2", a.ndim)
+
+        if axis1 == axis2:
+            raise ValueError("axis1 and axis2 cannot be the same")
+
+        a = asarray(a)
+        k = offset
+        if axis1 > axis2:
+            axis1, axis2 = axis2, axis1
+            k = -offset
+
+        free_axes = set(range(a.ndim)) - {axis1, axis2}
+        free_indices = list(product(*(range(a.numblocks[i]) for i in free_axes)))
+        ndims_free = len(free_axes)
+
+        # equation of diagonal: i = j - k
+        kdiag_row_start = max(0, -k)
+        kdiag_col_start = max(0, k)
+        kdiag_row_stop = min(a.shape[axis1], a.shape[axis2] - k)
+        len_kdiag = kdiag_row_stop - kdiag_row_start
+
+        if len_kdiag <= 0:
+            xp = np
+
+            if is_cupy_type(a._meta):
+                import cupy
+
+                xp = cupy
+
+            out_chunks = pop_axes(a.chunks, axis1, axis2) + ((0,),)
+            dsk = dict()
+            for free_idx in free_indices:
+                shape = tuple(
+                    out_chunks[axis][free_idx[axis]] for axis in range(ndims_free)
+                )
+                dsk[(name,) + free_idx + (0,)] = (
+                    partial(xp.empty, dtype=a.dtype),
+                    shape + (0,),
+                )
+
+            meta = meta_from_array(a, ndims_free + 1)
+            return Array(dsk, name, out_chunks, meta=meta)
+
+        # compute row index ranges for chunks along axis1:
+        row_stops_ = np.cumsum(a.chunks[axis1])
+        row_starts = np.roll(row_stops_, 1)
+        row_starts[0] = 0
+
+        # compute column index ranges for chunks along axis2:
+        col_stops_ = np.cumsum(a.chunks[axis2])
+        col_starts = np.roll(col_stops_, 1)
+        col_starts[0] = 0
+
+        # locate first chunk containing diagonal:
+        row_blockid = np.arange(a.numblocks[axis1])
+        col_blockid = np.arange(a.numblocks[axis2])
+
+        row_filter = (row_starts <= kdiag_row_start) & (kdiag_row_start < row_stops_)
+        col_filter = (col_starts <= kdiag_col_start) & (kdiag_col_start < col_stops_)
+        (I,) = row_blockid[row_filter]
+        (J,) = col_blockid[col_filter]
+
+        # follow k-diagonal through chunks while constructing dask graph:
+        dsk = dict()
+        i = 0
+        kdiag_chunks = ()
+        while kdiag_row_start < a.shape[axis1] and kdiag_col_start < a.shape[axis2]:
+            # localize block info:
+            nrows, ncols = a.chunks[axis1][I], a.chunks[axis2][J]
+            kdiag_row_start -= row_starts[I]
+            kdiag_col_start -= col_starts[J]
+            k = -kdiag_row_start if kdiag_row_start > 0 else kdiag_col_start
+            kdiag_row_end = min(nrows, ncols - k)
+            kdiag_len = kdiag_row_end - kdiag_row_start
+
+            # increment dask graph:
+            for free_idx in free_indices:
+                input_idx = (
+                    free_idx[:axis1]
+                    + (I,)
+                    + free_idx[axis1 : axis2 - 1]
+                    + (J,)
+                    + free_idx[axis2 - 1 :]
+                )
+                output_idx = free_idx + (i,)
+                dsk[(name,) + output_idx] = (
+                    np_fill_diagonal,
+                    (a.name,) + input_idx,
+                    val,
+                    wrap
+                )
+
+            kdiag_chunks += (kdiag_len,)
+            # prepare for next iteration:
+            i += 1
+            kdiag_row_start = kdiag_row_end + row_starts[I]
+            kdiag_col_start = min(ncols, nrows + k) + col_starts[J]
+            I = I + 1 if kdiag_row_start == row_stops_[I] else I
+            J = J + 1 if kdiag_col_start == col_stops_[J] else J
+
+        out_chunks = pop_axes(a.chunks, axis1, axis2) + (kdiag_chunks,)
+        graph = HighLevelGraph.from_collections(name, dsk, dependencies=[a])
+        meta = meta_from_array(a, ndims_free + 1)
+        return Array(graph, name, out_chunks, meta=meta)
+    if not isinstance(v, np.ndarray) and not isinstance(v, Array):
+        raise TypeError(f"v must be a dask array or numpy array, got {type(v)}")
+
+    name = "fill_diagonal-" + tokenize(v, val,wrap)
+
+    meta = meta_from_array(v, 2 if v.ndim == 1 else 1)
+
+    if isinstance(v, np.ndarray) or (
+        hasattr(v, "__array_function__") and not isinstance(v, Array)
+    ):
+        if v.ndim == 1:
+            chunks = ((v.shape[0],), (v.shape[0],))
+            dsk = {(name, 0, 0): (np_fill_diagonal, v, val,wrap)}
+        elif v.ndim == 2:
+            kdiag_row_start = 0
+            kdiag_row_stop = min(v.shape[0], v.shape[1])
+            len_kdiag = kdiag_row_stop - kdiag_row_start
+            chunks = ((0,),) if len_kdiag <= 0 else ((len_kdiag,),)
+            dsk = {(name, 0): (np_fill_diagonal, v, val,wrap)}
+        else:
+            return fill_diagonal_higher_dims(v, val,wrap)
+        return Array(dsk, name, chunks, meta=meta)
+
+    if v.ndim != 1:
+        if v.ndim != 2:
+            return fill_diagonal_higher_dims(v, val,wrap)
+        if v.chunks[0] == v.chunks[1]:
+            dsk = {
+                (name, i): (np_fill_diagonal, row[i],val,wrap) for i, row in enumerate(v.__dask_keys__())
+            }
+            graph = HighLevelGraph.from_collections(name, dsk, dependencies=[v])
+            return Array(graph, name, (v.chunks[0],), meta=meta)
+        else:
+            return fill_diagonal_higher_dims(v, val,wrap)
+
+    chunks_1d = v.chunks[0]
+    blocks = v.__dask_keys__()
+    dsk = {}
+    for i, m in enumerate(chunks_1d):
+        for j, n in enumerate(chunks_1d):
+            key = (name, i, j)
+            if i == j:
+                dsk[key] = (np_fill_diagonal, blocks[i],val,wrap)
+
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[v])
+    return Array(graph, name, (chunks_1d, chunks_1d), meta=meta)
 def to_backend(x: Array, backend: str | None = None, **kwargs):
     """Move an Array collection to a new backend
 
